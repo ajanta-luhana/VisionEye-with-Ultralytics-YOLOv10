@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VisionEye Zone Monitor</title>
+<style>
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; background:#0f1115; color:#e8e8e8; margin:0; padding:24px; }
+  h1 { font-size: 20px; margin-bottom: 4px; }
+  p.sub { color:#9aa0a6; margin-top:0; }
+  .card { background:#181b21; border:1px solid #2a2e37; border-radius:10px; padding:20px; margin-bottom:20px; max-width: 960px; }
+  button { background:#3d8bfd; color:white; border:none; padding:10px 16px; border-radius:6px; cursor:pointer; font-size:14px; margin-right:8px; }
+  button.secondary { background:#2a2e37; }
+  button:disabled { opacity:0.5; cursor:not-allowed; }
+  #canvasWrap { position:relative; display:inline-block; margin-top:12px; }
+  canvas { border:1px solid #2a2e37; border-radius:6px; cursor:crosshair; max-width:100%; }
+  .hint { color:#9aa0a6; font-size:13px; margin-top:8px; }
+  #zoneList { margin-top:10px; font-size:13px; color:#c9cdd3; }
+  table { border-collapse:collapse; margin-top:10px; }
+  td, th { border:1px solid #2a2e37; padding:6px 10px; font-size:13px; }
+  #status { margin-top:10px; font-size:13px; color:#f0c419; }
+  video { max-width:100%; border-radius:6px; margin-top:10px; }
+  a.dl { color:#3d8bfd; }
+  input[type=file] { color:#e8e8e8; }
+</style>
+</head>
+<body>
+  <h1>VisionEye Zone Monitor</h1>
+  <p class="sub">Upload a video, draw zones on the first frame, run detection.</p>
+
+  <div class="card" id="uploadCard">
+    <input type="file" id="videoInput" accept=".mp4,.avi,.mov,.mkv">
+    <button id="uploadBtn">Upload</button>
+    <div class="hint">mp4 / avi / mov / mkv</div>
+  </div>
+
+  <div class="card" id="drawCard" style="display:none;">
+    <div><strong>Draw zones</strong></div>
+    <div class="hint">Click to add a point &middot; double-click (or "Finish Zone") to close a zone with 3+ points &middot; repeat for more zones</div>
+    <div id="canvasWrap">
+      <canvas id="zoneCanvas"></canvas>
+    </div>
+    <div style="margin-top:12px;">
+      <button class="secondary" id="finishZoneBtn">Finish Zone</button>
+      <button class="secondary" id="undoPointBtn">Undo Point</button>
+      <button class="secondary" id="clearBtn">Clear All</button>
+      <button id="processBtn" disabled>Process Video</button>
+    </div>
+    <div id="zoneList"></div>
+    <div id="status"></div>
+  </div>
+
+  <div class="card" id="resultCard" style="display:none;">
+    <div><strong>Result</strong></div>
+    <video id="resultVideo" controls></video>
+    <div><a class="dl" id="downloadLink" href="#" download>Download processed video</a></div>
+    <div id="summary"></div>
+  </div>
+
+<script>
+let videoId = null;
+let origW = 0, origH = 0, scale = 1;
+let zones = [];          // completed zones, points in ORIGINAL image coords
+let currentZone = [];    // in-progress zone, points in ORIGINAL image coords
+const canvas = document.getElementById('zoneCanvas');
+const ctx = canvas.getContext('2d');
+const img = new Image();
+
+document.getElementById('uploadBtn').onclick = async () => {
+  const input = document.getElementById('videoInput');
+  if (!input.files.length) { alert('Choose a video file first'); return; }
+  const fd = new FormData();
+  fd.append('video', input.files[0]);
+  document.getElementById('uploadBtn').disabled = true;
+  document.getElementById('uploadBtn').textContent = 'Uploading...';
+  try {
+    const res = await fetch('/upload', { method: 'POST', body: fd });
+    const data = await res.json();
+    if (data.error) { alert(data.error); return; }
+    videoId = data.video_id;
+    origW = data.width; origH = data.height;
+    img.onload = () => {
+      const maxW = 900;
+      scale = Math.min(1, maxW / origW);
+      canvas.width = origW * scale;
+      canvas.height = origH * scale;
+      redraw();
+    };
+    img.src = data.frame_url;
+    document.getElementById('drawCard').style.display = 'block';
+  } catch (e) {
+    alert('Upload failed: ' + e);
+  } finally {
+    document.getElementById('uploadBtn').disabled = false;
+    document.getElementById('uploadBtn').textContent = 'Upload';
+  }
+};
+
+canvas.addEventListener('click', (e) => {
+  const rect = canvas.getBoundingClientRect();
+  const x = (e.clientX - rect.left) / scale;
+  const y = (e.clientY - rect.top) / scale;
+  currentZone.push({ x, y });
+  redraw();
+});
+
+canvas.addEventListener('dblclick', (e) => { e.preventDefault(); finishZone(); });
+document.getElementById('finishZoneBtn').onclick = finishZone;
+document.getElementById('undoPointBtn').onclick = () => { currentZone.pop(); redraw(); };
+document.getElementById('clearBtn').onclick = () => { zones = []; currentZone = []; redraw(); updateZoneList(); };
+document.getElementById('processBtn').onclick = processVideo;
+
+function finishZone() {
+  if (currentZone.length < 3) { alert('Need at least 3 points to close a zone'); return; }
+  zones.push({ name: 'ZONE ' + (zones.length + 1), points: currentZone });
+  currentZone = [];
+  redraw();
+  updateZoneList();
+  document.getElementById('processBtn').disabled = zones.length === 0;
+}
+
+function updateZoneList() {
+  document.getElementById('zoneList').textContent =
+    zones.length ? ('Zones: ' + zones.map(z => z.name + ' (' + z.points.length + ' pts)').join(', ')) : 'No zones yet';
+}
+
+function redraw() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  const palette = ['#ff6432', '#ff00c8', '#00ff00', '#00c8ff', '#ff0064'];
+  zones.forEach((z, i) => drawPoly(z.points, palette[i % palette.length], z.name));
+  if (currentZone.length) drawPoly(currentZone, '#ffff00', null, true);
+}
+
+function drawPoly(points, color, label, openPath) {
+  if (!points.length) return;
+  ctx.strokeStyle = color;
+  ctx.fillStyle = color + '55';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  points.forEach((p, i) => {
+    const dx = p.x * scale, dy = p.y * scale;
+    if (i === 0) ctx.moveTo(dx, dy); else ctx.lineTo(dx, dy);
+  });
+  if (!openPath) { ctx.closePath(); ctx.fill(); }
+  ctx.stroke();
+  points.forEach(p => {
+    ctx.beginPath();
+    ctx.arc(p.x * scale, p.y * scale, 4, 0, Math.PI * 2);
+    ctx.fillStyle = color;
+    ctx.fill();
+  });
+  if (label) {
+    const cx = points.reduce((s, p) => s + p.x, 0) / points.length * scale;
+    const cy = points.reduce((s, p) => s + p.y, 0) / points.length * scale;
+    ctx.fillStyle = '#fff';
+    ctx.font = '14px sans-serif';
+    ctx.fillText(label, cx - 20, cy);
+  }
+}
+
+async function processVideo() {
+  if (!zones.length) return;
+  document.getElementById('processBtn').disabled = true;
+  document.getElementById('status').textContent = 'Processing... this can take a while for long videos.';
+  try {
+    const res = await fetch('/process', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ video_id: videoId, zones })
+    });
+    const data = await res.json();
+    if (data.error) { alert(data.error); return; }
+    document.getElementById('status').textContent = '';
+    document.getElementById('resultCard').style.display = 'block';
+    document.getElementById('resultVideo').src = data.output_url;
+    document.getElementById('downloadLink').href = data.output_url;
+    let html = `<p>Frames processed: ${data.frames_processed} &middot; Total detections: ${data.grand_total}</p><table><tr><th>Zone</th><th>Class</th><th>Count</th></tr>`;
+    for (const [zone, counts] of Object.entries(data.zone_summary)) {
+      for (const [cls, count] of Object.entries(counts)) {
+        html += `<tr><td>${zone}</td><td>${cls}</td><td>${count}</td></tr>`;
+      }
+    }
+    html += '</table>';
+    document.getElementById('summary').innerHTML = html;
+  } catch (e) {
+    alert('Processing failed: ' + e);
+  } finally {
+    document.getElementById('processBtn').disabled = false;
+  }
+}
+</script>
+</body>
+</html>
